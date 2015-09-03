@@ -76,6 +76,7 @@ int touch_thermal_status = 0;
 int current_thermal_mode = 0;
 extern struct pseudo_batt_info_type pseudo_batt_info;
 int touch_ta_status = 0;
+int touch_hdmi_status = 0;
 u8 is_probe = 0;
 extern int is_Sensing;
 static struct lge_touch_data *ts_data = NULL;
@@ -148,11 +149,6 @@ void send_uevent_lpwg(struct i2c_client* client, int type)
 			&& atomic_read(&ts->state.uevent_state) == UEVENT_IDLE) {
 		atomic_set(&ts->state.uevent_state, UEVENT_BUSY);
 		send_uevent(lpwg_uevent[type-1]);
-		if (type == LPWG_DOUBLE_TAP) {
-			input_report_key(ts->input_dev, KEY_POWER, BUTTON_PRESSED);
-			input_report_key(ts->input_dev, KEY_POWER, BUTTON_RELEASED);
-			input_sync(ts->input_dev);
-		}
 	}
 }
 
@@ -910,9 +906,7 @@ static int power_control(struct lge_touch_data *ts, int on_off)
 		return 0;
 	}
 	/* To ignore the probe time */
-	if (ts->input_dev != NULL
-		&& (atomic_read(&ts->state.power_state) != on_off)
-		&& (atomic_read(&ts->state.power_state) == POWER_ON || atomic_read(&ts->state.power_state) == POWER_WAKE))
+	if (ts->input_dev != NULL)
 		release_all_touch_event(ts);
 
 	if (atomic_read(&ts->state.power_state) != on_off) {
@@ -1168,6 +1162,7 @@ int ghost_detect_solution(struct lge_touch_data *ts)
 			&& ts_ghost_value->pressure_zero) {
 		TOUCH_DEBUG(DEBUG_BASE_INFO, "z value is zero .\n");
 		ghost_detection = true;
+		ts_ghost_value->pressure_zero = false;
 	}
 
 	if (ts_ghost_value->check_enable.ta_debouncing_chk
@@ -1360,7 +1355,9 @@ static void touch_trigger_handle(struct work_struct *work_trigger_handle)
 		return;
 	}
 
-	if ((ts->ts_report_data.total_num || atomic_read(&ts->state.upgrade_state) == UPGRADE_START)
+	if ((ts->ts_report_data.total_num
+			|| atomic_read(&ts->state.upgrade_state) == UPGRADE_START
+			|| mutex_is_locked(&ts->thread_lock))
 			&& ta_rebase_retry_count < MAX_RETRY_COUNT) {
 		++ta_rebase_retry_count;
 		TOUCH_DEBUG(DEBUG_BASE_INFO,
@@ -1373,30 +1370,27 @@ static void touch_trigger_handle(struct work_struct *work_trigger_handle)
 			queue_delayed_work(touch_wq,
 							&ts->work_trigger_handle,
 							msecs_to_jiffies(0));
+		return;
 	} else {
 		if (atomic_read(&ts->state.device_init_state) == INIT_DONE) {
+			if (mutex_is_locked(&ts->thread_lock))
+				return;
+			mutex_lock(&ts->thread_lock);
 			if (touch_ta_status)
 				HANDLE_GHOST_ALG_RET(ghost_alg_ret = rebase_ic(ts));
 			else
 				goto do_init;
-		}
+		} else
+			return;
 	}
 
 do_reset_curr_data:
 ignore:
-	if (mutex_is_locked(&ts->thread_lock)) {
-		TOUCH_DEBUG(DEBUG_BASE_INFO, "mutex unlock, end rebase work .\n");
-		mutex_unlock(&ts->thread_lock);
-	}
+	mutex_unlock(&ts->thread_lock);
 	return;
 
 do_init:
 error:
-	if (mutex_is_locked(&ts->thread_lock)) {
-		TOUCH_DEBUG(DEBUG_BASE_INFO, "mutex unlock, end rebase work .\n");
-		mutex_unlock(&ts->thread_lock);
-	}
-	mutex_lock(&ts->thread_lock);
 	safety_reset(ts);
 	touch_ic_init(ts, 0);
 	mutex_unlock(&ts->thread_lock);
@@ -1413,7 +1407,7 @@ struct i2c_client*	client_only_for_update_status;
 void update_status(int code, int value)
 {
 	if (code == NOTIFY_TA_CONNECTION) {
-		if ((value && touch_ta_status) || (!boot_mode))
+		if ((value == touch_ta_status) || (!boot_mode))
 			return;
 		else
 			touch_ta_status = value;
@@ -1436,6 +1430,12 @@ void update_status(int code, int value)
 								msecs_to_jiffies(50));
 			}
 		}
+	} else if (code == NOTIFY_HDMI_CONNECTION) {
+		if ((value == touch_hdmi_status) || (!boot_mode))
+			return;
+		else
+			touch_hdmi_status = value;
+		TOUCH_DEBUG(DEBUG_BASE_INFO, "HDMI Connection : %d\n", touch_hdmi_status);
 	} else if (code == NOTIFY_TEMPERATURE_CHANGE)
 		atomic_set(&state->temperature_state, value);
 	else if (code == NOTIFY_PROXIMITY)
@@ -3072,8 +3072,6 @@ static int touch_probe(struct i2c_client *client,
 
 	set_bit(EV_SYN, ts->input_dev->evbit);
 	set_bit(EV_ABS, ts->input_dev->evbit);
-	set_bit(EV_KEY, ts->input_dev->evbit);
-	set_bit(KEY_POWER, ts->input_dev->keybit);
 	set_bit(INPUT_PROP_DIRECT, ts->input_dev->propbit);
 
 	input_set_abs_params(ts->input_dev,
